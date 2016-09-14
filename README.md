@@ -19,6 +19,15 @@ Not Tested:
 1. Multiple slab allocations per cache
 2. Multi-threaded env : Not implemented.
 
+## Directory structure
+
+1. include/kslab.h : Interface file exposed to the user
+2. src/kslab.c : Implementation of Slab-allocator
+3. test/kslab_test.c : Test program, testing basic implementation.
+4. README.md: this file
+5. Makefile, src/Makefile, test/Makefile: make files for compilation.
+6. Other git objects and License files!
+
 ## How-To
 
 ## Compile
