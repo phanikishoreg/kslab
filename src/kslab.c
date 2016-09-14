@@ -21,6 +21,7 @@
 #define NPAGES 8
 #define NBUFS 8
 #define HASH_TABLE_SIZE (PAGE_SIZE)
+#define HASH_KEY(v) (((unsigned)v) % HASH_TABLE_SIZE)
 
 /* Assuming PAGE_SIZE is a power of 2 */
 #define PAGE_SIZE (getpagesize())
@@ -29,12 +30,8 @@
 #define SMALL_KMEM_SLAB(x) ((struct kmem_slab *)(x + PAGE_SIZE - sizeof(struct kmem_slab)))
 #define SMALL_BUF_TO_SLAB(x) (((unsigned)x) & ~(PAGE_SIZE - 1))
 
-struct hash_entry {
-	struct kmem_bufctl *this, *next;
-};
-
 struct hash_table {
-	struct hash_entry *entry;
+	struct kmem_bufctl *this;
 };
 
 struct kmem_bufctl {
@@ -53,6 +50,59 @@ struct kmem_slab {
 
 	struct kmem_bufctl *freelist;
 };
+
+struct kmem_bufctl *
+hash_del(struct hash_table *htbl, void *buf)
+{
+	int key;
+	struct kmem_bufctl *tmp, *prev;
+
+	assert(htbl && buf);
+
+	key = HASH_KEY(buf);			
+
+	tmp = (htbl + key)->this;
+	prev = NULL;
+	while (tmp != NULL) {
+		if (tmp->buf == buf) {
+			if (prev) prev->next = tmp->next;
+			else (htbl + key)->this = tmp->next;
+			return tmp;
+		}
+
+		prev = tmp;
+		tmp = tmp->next;
+	}
+
+	return NULL;
+}
+
+void
+hash_add(struct hash_table *htbl, struct kmem_bufctl *bfc)
+{
+	void *buf;
+	struct kmem_bufctl *tmp;
+	int key;
+
+	assert (htbl && bfc);
+
+	buf = bfc->buf;
+	assert(buf);
+
+	key = HASH_KEY(buf);
+
+	tmp = (htbl + key)->this;
+	bfc->next = tmp;
+	(htbl + key)->this = bfc;
+
+	tmp = (htbl + key)->this;
+
+	while (tmp != NULL) {
+		tmp = tmp->next;
+	}
+
+	return;
+}
 
 static struct kmem_cache *slab_cache, *bufctl_cache;
 
@@ -140,7 +190,7 @@ __create_small_slab(struct kmem_cache *kcp)
 static inline struct kmem_slab *
 __create_big_slab(struct kmem_cache *kcp)
 {
-	struct kmem_slab *new_slab;
+	struct kmem_slab *new_slab, *gslb;
 	struct kmem_bufctl *list, *tmp;
 	size_t bufsz;
 	void *buf;
@@ -159,6 +209,13 @@ __create_big_slab(struct kmem_cache *kcp)
 	}
 
 	new_slab = (struct kmem_slab *)kmem_cache_alloc(slab_cache, KM_NOSLEEP);
+	if (new_slab == NULL) {
+		gslb = kmem_cache_grow(slab_cache);
+		assert(gslb);
+
+		/* for multiple-slabs in slab cache */
+		new_slab = (struct kmem_slab *)kmem_cache_alloc(slab_cache, KM_NOSLEEP);
+	}
 	assert(new_slab);
 
 	new_slab->type = kcp;
@@ -179,6 +236,13 @@ __create_big_slab(struct kmem_cache *kcp)
 	list = NULL;
 	for (i = 0 ; i < new_slab->free ; i ++) {
 		tmp = (struct kmem_bufctl *) kmem_cache_alloc(bufctl_cache, KM_NOSLEEP);
+		if (tmp == NULL) {
+			gslb = kmem_cache_grow(bufctl_cache);
+			assert(gslb);
+			
+			/* for multiple-slabs in bufctl cache */
+			tmp = (struct kmem_bufctl *) kmem_cache_alloc(bufctl_cache, KM_NOSLEEP);
+		}
 		assert(tmp);
 
 		/* construct objects */
@@ -252,6 +316,7 @@ __destroy_small_slab(struct kmem_cache *kcp, struct kmem_slab *slb)
 	}
 
 	free(buf);
+	buf = NULL;
 
 	return;
 }
@@ -284,6 +349,8 @@ __destroy_big_slab(struct kmem_cache *kcp, struct kmem_slab *slb)
 	}
 
 	free(buf);
+	buf = NULL;
+
 	kmem_cache_free(slab_cache, slb);
 
 	return;
@@ -299,10 +366,11 @@ __destroy_small_cache(struct kmem_cache *kcp)
 	assert(!kcp->slab_full);
 	assert(kcp->slab_free->next == kcp->slab_free);
 
-	__destroy_small_slab(kcp, kcp->slab_free);
+	kmem_cache_reap(kcp, kcp->slab_free);
 	kcp->slab_free = NULL;
 
 	free(kcp);
+	/* to whomsoever this may concern: you've dangling pointer now */
 
 	return;
 }
@@ -310,13 +378,18 @@ __destroy_small_cache(struct kmem_cache *kcp)
 static inline void
 __destroy_big_cache(struct kmem_cache *kcp)
 {
-	assert(kcp && IS_SMALL(kcp));
+	assert(kcp && !IS_SMALL(kcp));
 	assert(!kcp->slab_full);
 	assert(kcp->slab_free->next == kcp->slab_free);
 
-	__destroy_big_slab(kcp, kcp->slab_free);
+	kmem_cache_reap(kcp, kcp->slab_free);
+	kcp->slab_free = NULL;
+
+	if (kcp->htbl) free(kcp->htbl);
+	kcp->htbl = NULL;
 
 	free(kcp);
+	/* to whomsoever this may concern: you've dangling pointer now */
 
 	return;
 }
@@ -372,7 +445,7 @@ __alloc_big_buf(struct kmem_cache *kcp, int flags)
 	struct kmem_bufctl *tmpbf;
 	void *buf;
 
-	assert(kcp && IS_SMALL(kcp));
+	assert(kcp && !IS_SMALL(kcp));
 
 	tmp = kcp->slab_free;
 	
@@ -387,11 +460,18 @@ __alloc_big_buf(struct kmem_cache *kcp, int flags)
 	tmp->free --;
 	tmpbf = tmp->freelist;
 	tmp->freelist = tmp->freelist->next;
-
-	//htable_set(kcp->htbl, tmpbf);
 	buf = tmpbf->buf;
 
-	if (tmp->free == 0) ; /* move it to slab_full */
+	hash_add(kcp->htbl, tmpbf);
+
+	if (tmp->free == 0) {
+		struct kmem_slab *p;
+
+		p = cdl_remove(tmp);
+		if (tmp == p) kcp->slab_free = NULL;
+		if (kcp->slab_full == NULL) kcp->slab_full = p;
+		else cdl_insert(kcp->slab_full, p); 
+	} 
 
 	return buf;
 }
@@ -406,14 +486,9 @@ kmem_cache_alloc(struct kmem_cache *kcp, int flags)
 }
 
 static inline void
-__free_small_buf(struct kmem_cache *kcp, void *buf)
+__free_any_buf(struct kmem_cache *kcp, struct kmem_slab *slb)
 {
-	int full = 0, i;
-	struct kmem_slab *slb = SMALL_KMEM_SLAB(SMALL_BUF_TO_SLAB(buf));
-
-	*((unsigned *)(buf + kcp->sz)) = (unsigned)(slb->freelist);
-	/* crazy */
-	slb->freelist = (struct kmem_bufctl *)buf;
+	int full = 0;
 
 	if (slb->free == 0) full = 1;
 	slb->free ++;
@@ -423,14 +498,7 @@ __free_small_buf(struct kmem_cache *kcp, void *buf)
 		/* if this is the only slab, don't destroy it until kmem_cache_destroy() */
 		if (kcp->slab_full == NULL && (slb->next == slb)) return;
 
-		slb = cdl_remove(slb); 
-		buf = (void *)SMALL_BUF_TO_SLAB(buf);
-		for (i = 0 ; i < slb->free ; i ++) {
-			/* construct objects */
-			if (kcp->dtor) kcp->dtor((buf + i * kcp->sz_aligned), kcp->sz);
-		}
-		if (buf) free(buf);
-		buf = NULL;
+		kmem_cache_reap(kcp, slb);
 	} 
 	if (full) {
 		slb = cdl_remove(slb);
@@ -439,30 +507,43 @@ __free_small_buf(struct kmem_cache *kcp, void *buf)
 		if (kcp->slab_free == NULL) kcp->slab_free = slb;
 		else cdl_insert(kcp->slab_free, slb);
 	}
+
+}
+
+static inline void
+__free_small_buf(struct kmem_cache *kcp, void *buf)
+{
+	int full = 0;
+	struct kmem_slab *slb;
+
+	assert(kcp && buf);
+
+	slb = SMALL_KMEM_SLAB(SMALL_BUF_TO_SLAB(buf));
+	*((unsigned *)(buf + kcp->sz)) = (unsigned)(slb->freelist);
+	/* crazy */
+	slb->freelist = (struct kmem_bufctl *)buf;
+	__free_any_buf(kcp, slb);
+
 	return;
 }
 
 static inline void
 __free_big_buf(struct kmem_cache *kcp, void *buf)
 {
+	int full = 0;
 	struct kmem_bufctl *bfc;
 	struct kmem_slab *slb;
 
-	//bfc = htable_get(kcp->htbl, buf);
+	assert(kcp && buf);
+
+	bfc = hash_del(kcp->htbl, buf);
+	assert(bfc);
+
 	slb = bfc->container;
+	bfc->next = slb->freelist;
+	slb->freelist = bfc;
 
-	if (slb->free == 0) { /* remove from slab_full and add to slab_free list */
-
-		/*
-		slb = cdlist_delete(kcp->slab_full, slb);
-		cdlist_insert(kcp->slab_free, slb);
-		*/
-	}
-
-	slb->free ++;
-	slb->used --;
-
-	if (slb->used == 0) /* destroy slab */;
+	__free_any_buf(kcp, slb);
 	return;
 }
 
