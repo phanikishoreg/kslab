@@ -34,3 +34,6 @@
 
 # Coredump
 core
+
+# Kslab objs
+test/kslab_test

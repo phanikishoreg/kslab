@@ -95,12 +95,6 @@ hash_add(struct hash_table *htbl, struct kmem_bufctl *bfc)
 	bfc->next = tmp;
 	(htbl + key)->this = bfc;
 
-	tmp = (htbl + key)->this;
-
-	while (tmp != NULL) {
-		tmp = tmp->next;
-	}
-
 	return;
 }
 
@@ -423,7 +417,7 @@ __alloc_small_buf(struct kmem_cache *kcp, int flags)
 	tmp->used ++;
 	tmp->free --;
 	buf = (void *)tmp->freelist;
-	*(unsigned *)(buf + kcp->sz) = 1;
+	*(unsigned *)(buf + kcp->sz) = ALLOCD;
 	tmp->freelist = (struct kmem_bufctl *)(buf + kcp->sz_aligned);
 	
 	if (tmp->free == 0) {
@@ -517,6 +511,7 @@ __free_small_buf(struct kmem_cache *kcp, void *buf)
 	struct kmem_slab *slb;
 
 	assert(kcp && buf);
+	assert(*(unsigned *)(buf + kcp->sz) == (unsigned)ALLOCD);
 
 	slb = SMALL_KMEM_SLAB(SMALL_BUF_TO_SLAB(buf));
 	*((unsigned *)(buf + kcp->sz)) = (unsigned)(slb->freelist);
