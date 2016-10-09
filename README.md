@@ -44,7 +44,7 @@ make clean all
 
 From the test/ directory of this project, run:
 ```
-./kmem_test
+./kslab_test
 ```
 
 I've tested with valgrind to see if I've basic mem leaks and there are none. 
